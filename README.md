@@ -57,7 +57,8 @@ bash examples/demo.sh                 # 关阀隔离预演（原能力），默�
 bash examples/demo.sh http://主机:端口
 bash examples/restore_demo.sh         # 复水计划：逐步预演 → 保存 → 修订号逐步执行
 bash examples/derating_demo.sh        # 抢修降额：同快照对比现状/降额两种情景
-bash examples/schedule_demo.sh        # 多时段储水调度：逐期补水/溢出/分配/扣减储水（本轮新增）
+bash examples/schedule_demo.sh        # 多时段储水调度：逐期补水/溢出/分配/扣减储水
+bash examples/guarantee_demo.sh       # 最低保障供水：联合可行性 + 保保障逐点最大化（本轮新增）
 ```
 
 ---
@@ -123,6 +124,7 @@ Compose 的端口映射在 `docker-compose.yml` 中修改左侧即可（如 `"18
 | POST | `/api/drill` | 关阀隔离**预演**（只读，不写入） |
 | POST | `/api/derating/preview` | 抢修**降额影响预演**：水源/管段临时容量上限，同快照对比现状/降额（只读） |
 | POST | `/api/schedule/preview` | 多时段**有限储水调度预演**：逐期补水/溢出/分配/扣减储水（只读） |
+| POST | `/api/guarantee/preview` | 抢修**最低保障供水预演**：保障量联合可行性判定，可行则保保障逐点最大化（只读） |
 | GET | `/api/status` | 当前真实阀位下的分派结果（含 `revision`） |
 | POST | `/api/restore/plans` | 复水**逐步预演**；全部安全才保存不可变计划 |
 | GET | `/api/restore/plans` | 计划列表（状态/进度） |
@@ -482,7 +484,141 @@ curl -X POST http://localhost:8080/api/schedule/preview \
 端到端示例见 [`examples/schedule_demo.sh`](examples/schedule_demo.sh)
 （两期滚动、超库容、未知/错类/重复/缺失、空时段、过期修订号、预演不写入）。
 
-### 4.6 错误码速查
+### 4.6 抢修最低保障供水预演 `POST /api/guarantee/preview`
+
+抢修调度需预演各用水点的**最低保障供水**。操作者提交：
+
+- `revision`：**当前管网修订号**（取自 `GET /api/network` 或 `GET /api/status`），
+  过期则整单 409 拒绝，**不返回混合版本结果**；
+- `guarantees`：**恰好覆盖所有用水点**的保障量清单（不重复、不缺失、不多余）。
+  每个保障量必须是**有限非负数**（允许 `0`），且**不得超过该点现有需求**
+  （等于需求合法）。未知/错类设施（把水源、管段、连接点编号放进清单）、
+  重复/缺失条目、保障量超需求一次性带 `guarantees[i].*` 定位返回 400。
+
+服务按以下两步求解（**只读**，不改变管网、阀位、计划或修订号）：
+
+1. **联合可行性判定**：在**当前阀位、单向管段、水源上限与共享管段容量**下做一次
+   联合最大流（每个用水点到超汇的容量上界 = 其保障量），判断**全部保障量能否
+   同时满足**。
+   - **不可行**时**只返回保障缺口与瓶颈设施**（`feasible: false`），
+     **不返回部分成功方案**：逐点给出 `deliverable`（联合流可交付量，仅用于量化
+     缺口，不是供水方案）、`shortfall` 与原因码（`ISOLATED` / `SOURCE_LIMIT` /
+     `PIPE_LIMIT` / `SOURCE_AND_PIPE_LIMIT`），并给出全局
+     `bottleneck_sources` / `bottleneck_pipes`（含容量、已用、剩余、是否导通、
+     关闭阀门）。
+2. **可行**时（`feasible: true`）：**保持所有保障量**，再按现有优先级
+   （priority 降序、同级编号升序）**逐点最大化额外供水**——最大化某点时，
+   已处理点的**总供水量只增不减、但允许重排其输水路径**（“必要时重排先前流量”，
+   以腾出共享管段/水源额度），未处理点保持保障量；单点总供水不超过其需求。
+   响应逐点给出 `guarantee` / `supplied` / `extra_supplied` / `shortfall` /
+   `by_source`，以及全局 `source_utilization` / `pipe_utilization`（容量不重复占用）。
+
+```bash
+# revision 先取自 GET /api/network（或 /api/status）
+curl -X POST http://localhost:8080/api/guarantee/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "revision": 1,
+        "guarantees": [
+          {"demand_id": "D1", "guarantee": 0},
+          {"demand_id": "D2", "guarantee": 4},
+          {"demand_id": "D3", "guarantee": 2}
+        ]
+      }'
+```
+
+可行响应（节选）：
+
+```json
+{
+  "feasible": true,
+  "revision": 1,
+  "message": "保障预演：全部保障量可同时满足；已在保持所有保障量的前提下，按优先级降序、同级编号升序逐点最大化额外供水（允许重排先前流量路径）……",
+  "guarantees": [
+    {"demand_id": "D1", "guarantee": 0.0},
+    {"demand_id": "D2", "guarantee": 4.0},
+    {"demand_id": "D3", "guarantee": 2.0}
+  ],
+  "allocations": [
+    {"demand_id": "D1", "priority": 9, "requested": 10.0,
+     "guarantee": 0.0, "supplied": 10.0, "extra_supplied": 10.0,
+     "shortfall": 0.0, "fulfilled": true, "guarantee_met": true,
+     "by_source": {"S1": 10.0}},
+    {"demand_id": "D2", "priority": 1, "requested": 8.0,
+     "guarantee": 4.0, "supplied": 4.0, "extra_supplied": 0.0,
+     "shortfall": 4.0, "fulfilled": false, "guarantee_met": true,
+     "by_source": {"S2": 4.0}},
+    {"demand_id": "D3", "priority": 1, "requested": 6.0,
+     "guarantee": 2.0, "supplied": 2.0, "extra_supplied": 0.0,
+     "shortfall": 4.0, "fulfilled": false, "guarantee_met": true,
+     "by_source": {"S2": 2.0}}
+  ],
+  "totals": {"requested": 24.0, "guarantee": 6.0,
+             "supplied": 16.0, "extra_supplied": 10.0, "shortfall": 8.0},
+  "source_utilization": ["...各水源容量/已用/剩余..."],
+  "pipe_utilization": ["...各管段容量/已用/剩余/导通..."]
+}
+```
+
+不可行响应（节选；无 `source_utilization` / `pipe_utilization` / `by_source`，
+即**不返回部分成功方案**）：
+
+```json
+{
+  "feasible": false,
+  "revision": 1,
+  "message": "保障预演：全部保障量无法……同时满足；以下仅给出保障缺口与瓶颈设施，未返回部分成功方案，且未改变管网、阀位、计划或修订号",
+  "guarantees": ["...保障量回显..."],
+  "allocations": [
+    {"demand_id": "D2", "priority": 1, "demand": 8.0,
+     "guarantee": 8.0, "deliverable": 4.0, "shortfall": 4.0,
+     "guarantee_met": false, "shortfall_reason_code": "PIPE_LIMIT",
+     "shortfall_reason": "用水点 D2 保障缺口 4.000：……",
+     "constrained_pipes": [{"pipe_id": "P3", "...": "..."}]}
+  ],
+  "totals": {"guarantee": 24.0, "deliverable": 16.0, "shortfall": 8.0},
+  "bottleneck_sources": [],
+  "bottleneck_pipes": [
+    {"pipe_id": "P2", "from_node": "S2", "to_node": "J1",
+     "capacity": 6.0, "used": 6.0, "remaining": 0.0,
+     "conducting": true, "closed_valves": []}
+  ]
+}
+```
+
+> 实现要点：可行阶段的“保保障 + 重排先前流量”用**带流量下界的最大流**求解——
+> 逐点把已处理点总供水固定为下界=上界（路径可重排）、未处理点固定为保障量、
+> 当前点上界放到需求，经下界可行环流后在残余网络中继续推送，得到该点的
+> 最大可获得水量。瓶颈定位取**最靠近汇的最小割**（沿原始正向边的反向 BFS），
+> 以便在水源与下游管段同时饱和时定位到真正卡住输送的共享管段。
+
+校验失败示例（多个问题一次性定位，整单拒绝、不出任何结果）：
+
+```json
+{
+  "error": {
+    "code": "invalid_guarantee",
+    "message": "保障预演参数校验失败，整单已拒绝（未做任何预演、未改变状态）",
+    "details": [
+      {"location": "guarantees[0].demand_id", "code": "unknown_facility",
+       "facility_id": "GHOST", "message": "未知设施：GHOST（当前管网中不存在该用水点）"},
+      {"location": "guarantees[0].guarantee", "code": "guarantee_above_demand",
+       "facility_id": "D1", "current_demand": 10.0, "submitted_guarantee": 11.0,
+       "message": "用水点 D1 的保障量 11 超过其现有需求 10；保障量不得超过现有需求"},
+      {"location": "guarantees[1].demand_id", "code": "duplicate_facility",
+       "facility_id": "D2", "message": "条目重复：D2 在 guarantees 中出现多次"},
+      {"location": "guarantees", "code": "missing_entry", "facility_id": "D3",
+       "message": "缺失条目：guarantees 必须恰好列出所有用水点的保障量，缺少 D3"}
+    ]
+  }
+}
+```
+
+端到端示例见 [`examples/guarantee_demo.sh`](examples/guarantee_demo.sh)
+（可行逐点最大化、不可行缺口与瓶颈、超需求/未知/错类/重复/缺失、负数、
+过期修订号、关阀隔离、预演不写入）。
+
+### 4.7 错误码速查
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
@@ -493,6 +629,7 @@ curl -X POST http://localhost:8080/api/schedule/preview \
 | 400 | `invalid_drill` | 预演阀门编号未知/重复 |
 | 400 | `invalid_derating` | 降额设施未知、类别错误、同一类别内重复、临时上限超过额定容量（带 `sources[i].*`/`pipes[i].*` 定位） |
 | 400 | `invalid_schedule` | 调度预演：未知/错类设施、重复/缺失条目、初始储水超库容（带 `sources[i].*`/`periods[i].*` 定位） |
+| 400 | `invalid_guarantee` | 保障预演：未知/错类设施、重复/缺失条目、保障量超过现有需求（带 `guarantees[i].*` 定位） |
 | 409 | `revision_conflict` | 降额/调度预演（或复水执行）携带的修订号已过期；整单拒绝、不返回混合版本结果 |
 | 400 | `invalid_restore_plan` | 复水步骤含未知阀门、非法动作或重复阀门（带 `steps[i].*` 定位，计划不保存） |
 | 404 | `plan_not_found` | 计划编号不存在 |
@@ -618,6 +755,8 @@ curl -X POST http://localhost:8080/api/restore/plans/PLAN-9f2c.../execute \
   `revision`（过期 409，拒绝出混合版本结果），但预演本身**不推进**修订号、不失效任何计划。
 - **调度预演** `POST /api/schedule/preview` 同为只读操作：修订号规则与降额预演一致，
   逐期储水滚动只在内存中演算，不落库。
+- **保障预演** `POST /api/guarantee/preview` 同为只读操作：修订号规则与降额/调度
+  预演一致；可行性判定与逐点最大化都在内存中完成（带流量下界的最大流，重排但不落库）。
 
 > 与旧版的兼容：以上均为**新增字段/新增接口**；`PUT/GET/DELETE /api/network`、
 > `/api/valves/change`、`/api/drill`、`/api/status` 的原有字段与错误码不变，老客户端无需改造。
@@ -632,7 +771,8 @@ curl -X POST http://localhost:8080/api/restore/plans/PLAN-9f2c.../execute \
 │   ├── main.py        # FastAPI 路由、错误处理、整批事务、复水计划执行、降额/调度预演
 │   ├── engine.py      # 校验、互锁连通(BFS)、Dinic 最大流、优先级贪心预演
 │   ├── derating.py    # 降额条目校验、内存容量叠加、现状/降额同快照对比预演
-│   ├── schedule.py    # 调度条目校验、逐期补水/溢出/分配/储水滚动（本轮新增）
+│   ├── schedule.py    # 调度条目校验、逐期补水/溢出/分配/储水滚动
+│   ├── guarantee.py   # 保障条目校验、联合可行性与保保障逐点最大化（本轮新增）
 │   ├── plans.py       # 复水步骤校验、逐步预演、逐步结果快照
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── database.py    # SQLite 连接、建表、修订号
@@ -643,7 +783,8 @@ curl -X POST http://localhost:8080/api/restore/plans/PLAN-9f2c.../execute \
 │   ├── demo.sh            # 关阀隔离 curl 端到端示例
 │   ├── restore_demo.sh    # 复水计划 curl 端到端示例
 │   ├── derating_demo.sh   # 抢修降额 curl 端到端示例
-│   └── schedule_demo.sh   # 多时段储水调度 curl 端到端示例（本轮新增）
+│   └── schedule_demo.sh   # 多时段储水调度 curl 端到端示例
+│   └── guarantee_demo.sh  # 最低保障供水 curl 端到端示例（本轮新增）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

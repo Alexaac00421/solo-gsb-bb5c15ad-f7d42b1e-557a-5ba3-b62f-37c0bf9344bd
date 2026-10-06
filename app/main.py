@@ -10,6 +10,7 @@
   GET    /api/status                   当前真实阀位下的分派结果（含 revision）
   POST   /api/derating/preview         抢修降额影响预演（只读；同快照对比现状/降额两种情景）
   POST   /api/schedule/preview         多时段有限储水调度预演（只读；逐期补水/分配/扣减储水）
+  POST   /api/guarantee/preview        抢修最低保障供水预演（只读；保障量联合可行性 + 保保障逐点最大化）
   POST   /api/restore/plans            复水逐步预演；全部安全才保存不可变计划
   GET    /api/restore/plans            计划列表
   GET    /api/restore/plans/{plan_id}  计划详情（步骤与进度）
@@ -39,6 +40,7 @@ from .engine import (
 from . import plans as plans_svc
 from . import derating as derating_svc
 from . import schedule as schedule_svc
+from . import guarantee as guarantee_svc
 from .repository import (
     get_plan,
     get_step_result,
@@ -53,6 +55,7 @@ from .repository import (
 from .schemas import (
     DeratingPreviewRequest,
     DrillRequest,
+    GuaranteePreviewRequest,
     NetworkLoad,
     PlanExecuteRequest,
     RestorePlanRequest,
@@ -136,6 +139,7 @@ def root():
             "PUT /api/network", "GET /api/network", "DELETE /api/network",
             "POST /api/valves/change", "POST /api/drill", "GET /api/status",
             "POST /api/derating/preview", "POST /api/schedule/preview",
+            "POST /api/guarantee/preview",
             "POST /api/restore/plans", "GET /api/restore/plans",
             "GET /api/restore/plans/{plan_id}",
             "POST /api/restore/plans/{plan_id}/execute",
@@ -480,6 +484,60 @@ def schedule_preview(payload: SchedulePreviewRequest, conn=Depends(get_conn)):
         return schedule_svc.preview(
             network, current_revision, data["sources"], data["periods"]
         )
+
+
+# --------------------------------------------------------------------------- #
+# 抢修最低保障供水预演（只读，不写入状态/阀位/计划/修订号）
+# --------------------------------------------------------------------------- #
+@app.post("/api/guarantee/preview")
+def guarantee_preview_route(
+    payload: GuaranteePreviewRequest, conn=Depends(get_conn)
+):
+    """抢修调度预演各用水点的最低保障供水。
+
+    - 必须携带当前所见修订号；过期整单 409 拒绝，不返回混合版本结果；
+    - guarantees 须恰好覆盖所有用水点（不重复、不缺失、不多余），
+      每个保障量为有限非负数且不超过该点现有需求；
+    - 先按当前阀位、单向管段、水源上限与共享管段容量做联合最大流，
+      判定全部保障量能否同时满足；不可行时只返回保障缺口与瓶颈设施，
+      不返回部分成功方案；
+    - 可行时保持所有保障量，再按优先级降序、同级编号升序逐点最大化
+      额外供水（允许重排先前流量路径），单点总供水不超过需求；
+    - 预演仅作用于内存：不改变管网、阀位、计划或修订号。
+    """
+    # 读取与求解在同一把写锁内完成，保证“同一已提交快照”，
+    # 不会与录入/阀变/复水执行等写事务穿插而产生混合版本结果。
+    with _write_lock:
+        network = load_network(conn)
+        if network is None:
+            return error_response(
+                409, "network_not_initialized",
+                "尚未录入管网数据，请先调用 PUT /api/network",
+            )
+        current_revision = get_revision(conn)
+        if payload.revision != current_revision:
+            return error_response(
+                409, "revision_conflict",
+                f"修订号已过期：所见 {payload.revision}，当前 {current_revision}；"
+                "请重新查询当前管网后重试，本次未做任何预演",
+                [{
+                    "location": "revision",
+                    "code": "stale_revision",
+                    "seen_revision": payload.revision,
+                    "current_revision": current_revision,
+                }],
+            )
+
+        items = payload.model_dump()["guarantees"]
+        _guarantee_map, errs = guarantee_svc.validate_guarantees(network, items)
+        if errs:
+            return error_response(
+                400, "invalid_guarantee",
+                "保障预演参数校验失败，整单已拒绝（未做任何预演、未改变状态）",
+                errs,
+            )
+
+        return guarantee_svc.preview(network, current_revision, items)
 
 
 # --------------------------------------------------------------------------- #

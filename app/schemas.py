@@ -191,6 +191,40 @@ class SchedulePreviewRequest(StrictModel):
     )
 
 
+class GuaranteeIn(StrictModel):
+    """抢修保障预演中单个用水点的最低保障量。
+
+    有限非负由本层保证；“不得超过该点现有需求”“必须恰好覆盖所有用水点”
+    需要结合已提交管网快照，在服务层逐条定位校验。
+    """
+
+    demand_id: str = Field(min_length=1, max_length=64, description="用水点编号")
+    guarantee: float = Field(
+        ge=0, description="最低保障供水量（有限非负，且不超过该点现有需求）"
+    )
+
+    @field_validator("guarantee")
+    @classmethod
+    def _guarantee_finite(cls, v: float) -> float:
+        return _finite(v)
+
+
+class GuaranteePreviewRequest(StrictModel):
+    """抢修最低保障供水预演：携带所见修订号与每个用水点的保障量（只读，不写入）。
+
+    guarantees 必须恰好覆盖所有用水点（不重复、不缺失、不多余）；
+    缺省为空数组（无用水点管网时合法），“恰好覆盖”由服务层结合快照校验。
+    """
+
+    revision: int = Field(
+        ge=0, description="客户端当前所见管网基准修订号（过期则整单拒绝）"
+    )
+    guarantees: list[GuaranteeIn] = Field(
+        default_factory=list,
+        description="各用水点的最低保障量（须恰好覆盖所有用水点，不重复不缺失）",
+    )
+
+
 class RestoreStepIn(StrictModel):
     """复水计划中的单步：对某只阀门执行开/关。
 
