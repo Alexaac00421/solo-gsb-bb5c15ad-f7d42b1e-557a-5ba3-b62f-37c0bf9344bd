@@ -1,0 +1,29 @@
+{
+  "sources": [
+    {"id": "S1", "capacity": 10},
+    {"id": "S2", "capacity": 6}
+  ],
+  "demands": [
+    {"id": "D1", "demand": 10, "priority": 9},
+    {"id": "D2", "demand": 8, "priority": 1},
+    {"id": "D3", "demand": 6, "priority": 1}
+  ],
+  "junctions": [
+    {"id": "J1"}
+  ],
+  "pipes": [
+    {"id": "P1", "from_node": "S1", "to_node": "D1", "capacity": 10},
+    {"id": "P2", "from_node": "S2", "to_node": "J1", "capacity": 6},
+    {"id": "P3", "from_node": "J1", "to_node": "D2", "capacity": 4},
+    {"id": "P6", "from_node": "J1", "to_node": "D3", "capacity": 6},
+    {"id": "P5", "from_node": "S1", "to_node": "S2", "capacity": 5}
+  ],
+  "valves": [
+    {"id": "V1", "pipe_id": "P1", "is_open": true},
+    {"id": "V3", "pipe_id": "P3", "is_open": true},
+    {"id": "V5", "pipe_id": "P5", "is_open": false}
+  ],
+  "forbidden_pairs": [
+    {"source_a": "S1", "source_b": "S2"}
+  ]
+}
